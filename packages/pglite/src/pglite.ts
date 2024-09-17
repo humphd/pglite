@@ -55,10 +55,13 @@ export class PGlite
 
   #parser = new Parser()
 
-  // These are the current ArrayBuffer that is being read or written to
+  #queryInBuffer?: ArrayBuffer
+  #queryOutChunks?: Uint8Array[]
+
+  // These are the current /dev/blob ArrayBuffer that is being read or written to
   // during a query, such as COPY FROM or COPY TO.
-  #queryReadBuffer?: ArrayBuffer
-  #queryWriteChunks?: Uint8Array[]
+  #devBlobReadBuffer?: ArrayBuffer
+  #devBlobWriteChunks?: Uint8Array[]
 
   #notifyListeners = new Map<string, Set<(payload: string) => void>>()
   #globalNotifyListeners = new Set<(channel: string, payload: string) => void>()
@@ -206,7 +209,7 @@ export class PGlite
               length: number,
               position: number,
             ) => {
-              const buf = this.#queryReadBuffer
+              const buf = this.#devBlobReadBuffer
               if (!buf) {
                 throw new Error(
                   'No /dev/blob File or Blob provided to read from',
@@ -227,12 +230,14 @@ export class PGlite
               length: number,
               _position: number,
             ) => {
-              this.#queryWriteChunks ??= []
-              this.#queryWriteChunks.push(buffer.slice(offset, offset + length))
+              this.#devBlobWriteChunks ??= []
+              this.#devBlobWriteChunks.push(
+                buffer.slice(offset, offset + length),
+              )
               return length
             },
             llseek: (stream: any, offset: number, whence: number) => {
-              const buf = this.#queryReadBuffer
+              const buf = this.#devBlobReadBuffer
               if (!buf) {
                 throw new Error('No /dev/blob File or Blob provided to llseek')
               }
@@ -250,6 +255,93 @@ export class PGlite
           }
           mod.FS.registerDevice(devId, devOpt)
           mod.FS.mkdev('/dev/blob', devId)
+        },
+        (mod: any) => {
+          // Register /dev/query-in device
+          const devId = mod.FS.makedev(65, 0)
+          const devOpt = {
+            open: (_stream: any) => {},
+            close: (_stream: any) => {},
+            read: (
+              _stream: any,
+              buffer: Uint8Array,
+              offset: number,
+              length: number,
+              position: number,
+            ) => {
+              const buf = this.#queryInBuffer
+              if (!buf) {
+                throw new Error('No /dev/query-in Buffer provided to read from')
+              }
+              const contents = new Uint8Array(buf)
+              if (position >= contents.length) return 0
+              const size = Math.min(contents.length - position, length)
+              for (let i = 0; i < size; i++) {
+                buffer[offset + i] = contents[position + i]
+              }
+              return size
+            },
+            write: (
+              _stream: any,
+              _buffer: Uint8Array,
+              _offset: number,
+              _length: number,
+              _position: number,
+            ) => {
+              throw new Error('Not implemented')
+            },
+            llseek: (stream: any, offset: number, whence: number) => {
+              const buf = this.#queryInBuffer
+              if (!buf) {
+                throw new Error('No /dev/blob Buffer provided to llseek')
+              }
+              let position = offset
+              if (whence === 1) {
+                position += stream.position
+              } else if (whence === 2) {
+                position = new Uint8Array(buf).length
+              }
+              if (position < 0) {
+                throw new mod.FS.ErrnoError(28)
+              }
+              return position
+            },
+          }
+          mod.FS.registerDevice(devId, devOpt)
+          mod.FS.mkdev('/dev/query-in', devId)
+        },
+        (mod: any) => {
+          // Register /dev/query-out device
+          const devId = mod.FS.makedev(66, 0)
+          const devOpt = {
+            open: (_stream: any) => {},
+            close: (_stream: any) => {},
+            read: (
+              _stream: any,
+              _buffer: Uint8Array,
+              _offset: number,
+              _length: number,
+              _position: number,
+            ) => {
+              throw new Error('Not implemented')
+            },
+            write: (
+              _stream: any,
+              buffer: Uint8Array,
+              offset: number,
+              length: number,
+              _position: number,
+            ) => {
+              this.#queryOutChunks ??= []
+              this.#queryOutChunks.push(buffer.slice(offset, offset + length))
+              return length
+            },
+            llseek: (_stream: any, _offset: number, _whence: number) => {
+              throw new Error('Not implemented')
+            },
+          }
+          mod.FS.registerDevice(devId, devOpt)
+          mod.FS.mkdev('/dev/query-out', devId)
         },
       ],
     }
@@ -447,14 +539,14 @@ export class PGlite
    * @param file The file to handle
    */
   async _handleBlob(blob?: File | Blob) {
-    this.#queryReadBuffer = blob ? await blob.arrayBuffer() : undefined
+    this.#devBlobReadBuffer = blob ? await blob.arrayBuffer() : undefined
   }
 
   /**
    * Cleanup the current file
    */
   async _cleanupBlob() {
-    this.#queryReadBuffer = undefined
+    this.#devBlobReadBuffer = undefined
   }
 
   /**
@@ -462,11 +554,11 @@ export class PGlite
    * @returns The written blob
    */
   async _getWrittenBlob(): Promise<Blob | undefined> {
-    if (!this.#queryWriteChunks) {
+    if (!this.#devBlobWriteChunks) {
       return undefined
     }
-    const blob = new Blob(this.#queryWriteChunks)
-    this.#queryWriteChunks = undefined
+    const blob = new Blob(this.#devBlobWriteChunks)
+    this.#devBlobWriteChunks = undefined
     return blob
   }
 
@@ -502,29 +594,22 @@ export class PGlite
     message: Uint8Array,
     { syncToFs = true }: ExecProtocolOptions = {},
   ) {
-    const msg_len = message.length
-    const mod = this.mod!
-
-    // >0 set buffer content type to wire protocol
-    // set buffer size so answer will be at size+0x2 pointer addr
-    mod._interactive_write(msg_len)
-
-    // copy whole buffer at addr 0x1
-    mod.HEAPU8.set(message, 1)
+    // Make query available at /dev/query-in
+    this.#queryInBuffer = message
 
     // execute the message
-    mod._interactive_one()
+    this.#queryOutChunks = []
+    this.mod!._interactive_one()
 
-    // Read responses from the buffer
-    const msg_start = msg_len + 2
-    const msg_end = msg_start + mod._interactive_read()
-    const data = mod.HEAPU8.subarray(msg_start, msg_end)
+    // Read responses from /dev/query-out
+    const data = await new Blob(this.#queryOutChunks).arrayBuffer()
+    this.#queryOutChunks = undefined
 
     if (syncToFs) {
       await this.syncToFs()
     }
 
-    return data
+    return new Uint8Array(data)
   }
 
   /**
